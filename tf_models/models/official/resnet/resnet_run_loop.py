@@ -27,6 +27,10 @@ import argparse
 import os
 import numpy as np
 import tensorflow as tf  # pylint: disable=g-bad-import-order
+#CRAY ADDED
+#import tensorflow.contrib.eager as tfe
+#tfe.enable_eager_execution()
+#DONE CRAY ADDED
 
 from official.resnet import resnet_model
 from official.utils.arg_parsers import parsers
@@ -185,6 +189,8 @@ class AverageTrainMetrics(tf.train.SessionRunHook):
   
     format_str = ('TRAIN Session ENDED at %s: step %d (%.1f examples/sec; %.3f '
                   'sec/batch), learning rate: %.5f')
+    self.epoch_true = tf.train.global_step(session, self.epoch)/(self.step+1)
+    
     if (mc.get_rank() == 0):
       print('Epoch: ', self.epoch_true)
       print('global_step: %s' % tf.train.global_step(session, self.epoch))
@@ -402,32 +408,22 @@ def learning_rate_warmup_poly_decay(
 
 
   def learning_rate_fn(global_step):
+
     global_step = tf.cast(global_step, tf.float32)
-    #print("Global step:", global_step)
     #cstep = global_step*num_images/eff_batch_size
-    tsteps = tf.add(d_steps,w_steps)
-    step = tf.add(global_step,1.0)
-    step_per_epoch = tf.cast(batches_per_epoch,tf.float32) 
-    epoch = step/step_per_epoch
-    #global_step = tf.cast(global_step, tf.float32)
+    epoch = (d_steps + w_steps)/(global_step+1)
+
     total_epochs = decay_epochs + warmup_epochs
 
-    tf.Print(epoch, [epoch], "Current Epoch: ")
-    tf.Print(step, [step], "Current step: ")
-    
-    
-    print("Total Epochs = ", total_epochs)
-    #print("Current Epoch = ")
-
-    
+    tf.Print(epoch, [epoch], "Epoch: ")
     #current_step = tf.Print(cstep, [cstep], "Current train steps so far: ")
     if (mlcomm == 1):
         current_lr = learning_rate_0*math.pow(1.0-(decay_steps-warmup_steps)/decay_steps,2)
         if (mc.get_rank()==0):
-            print("Using Cray learning_rate_warmup_poly_decay(): ")         
+            print("Using Cray learning_rate_warmup_poly_decay(): ")
             print(" -> effective batch size: ", eff_batch_size)
-            print(" -> steps per epoch: ", batches_per_epoch)
-           
+            print(" -> batches per epoch: ", batches_per_epoch)
+
             print(" -> initial learning rate: ", learning_rate_0)
             print(" -> learning rate base: ", learning_rate_base)
             print(" -> starting global learning rate at first epoch: ", current_lr)
@@ -438,7 +434,7 @@ def learning_rate_warmup_poly_decay(
             print(" -> number workers: ", mc.get_nranks())
             #print(" -> Finished Epoch: ", tf.get_session_tensor(epoch), "/", total_epochs)
 
-    global_step = tf.cast(global_step, tf.float32)   
+    #global_step = tf.cast(global_step, tf.float32)   
     def lr_warmup(): return (lr_0 + global_step * (lr_base - lr_0) / w_steps)
     def lr_poly(): return (lr_base * math_ops.pow((1 - (global_step - w_steps) / d_steps), 2))
 
@@ -553,18 +549,11 @@ def resnet_model_fn(features, labels, mode, model_class,
     tf.summary.scalar('learning_rate', learning_rate)
 
     if (mlcomm == 1):
-      #__init__(self, learning_rate,                 momentum_coeff=0.9,
-        #weight_decay_coeff=0.0005,                lars_coeff=0.001,
-        #name="GDMomentumLARS")
-      #learning_rate = tf.Print(learning_rate, [learning_rate], "Using learning rate: ")
+      #GDMomentumLARS(self, learning_rate, momentum_coeff=0.9, weight_decay_coeff=0.0005, lars_coeff=0.001, name="GDMomentumLARS")
       optimizer = GDMomentumLARSOptimizer(
             momentum_coeff=0.9, weight_decay_coeff=0.0005, 
             lars_coeff=0.001, learning_rate=learning_rate)
 
-      #print('global_step: %s' % tf.train.global_step(sess, global_step))
-      
-
-      #tf.Print(learning_rate, [learning_rate], "Using learning rate: ")
     else:
       optimizer = tf.train.MomentumOptimizer(
           learning_rate=learning_rate,
@@ -744,11 +733,18 @@ def resnet_main(flags, model_function, input_function, num_train_samps, num_eval
           'data_format': flags.data_format,
           'batch_size': flags.batch_size,
           'multi_gpu': flags.multi_gpu,
+          'train_epochs': flags.train_epochs,
           'version': flags.version,
           'loss_scale': flags.loss_scale,
           'dtype': flags.dtype,
           'mlcomm': flags.enable_ml_comm,
           'log_freq': flags.global_perf_log_freq,
+          'weight_decay': flags.weight_decay,
+          'init_lr': flags.init_lr,
+          'base_lr': flags.base_lr,
+          'warmup_epochs': flags.warmup_epochs,
+          'log_freq': flags.global_perf_log_freq,
+
       })
 
   benchmark_logger = logger.config_benchmark_logger(flags.benchmark_log_dir)
@@ -852,6 +848,32 @@ class ResnetArgParser(argparse.ArgumentParser):
 	    '--global_perf_log_freq', '-pf', type=int, default=50,
 	    help='[default: %(default)s] Number of steps after which to report global (all process averages) training loss and performance'
     )
+
+
+
+    self.add_argument(
+        '--warmup_epochs', '-we', type=int, default=0,
+        help='[default: %(default)s] Number of warmup epochs when using LARS'
+    )
+
+
+    self.add_argument(
+        '--base_lr', '-blr', type=float, default=1.0,
+        help='[default: %(default)s] Learning rate to start after warmup epochs finish when using LARS'
+    )
+
+
+    self.add_argument(
+            '--init_lr', '-ilr', type=float, default=0.1,
+            help='[default: %(default)s] Learning rate to start warmup with when using LARS'
+    )
+
+
+    self.add_argument(
+            '--weight_decay', '-wd', type=float, default=1e-4,
+            help='[default: %(default)s] Weight decay to use during training'
+    )
+
 
 
   def parse_args(self, args=None, namespace=None):

@@ -22,7 +22,7 @@ source ./setup_env.sh
 #module load cray-python
 #module load /cray/css/perfeng/pjm/TFbuilds/tmp_inst/modulefiles/craype-ml-plugin-py2/1.0.1
 #module load /cray/css/users/jbalma/Innovation-Proposals/ML-Comm-Plugin/ml-mpi/tmp_inst/modulefiles/craype-ml-plugin-py2/1.1.0
-module load craype-ml-plugin-py2/1.1.0
+module load craype-ml-plugin-py2/1.1.1
 module list
 
 #export CRAYPE_ML_PLUGIN_BASEDIR=/cray/css/users/jbalma/Innovation-Proposals/ML-Comm-Plugin/ml-mpi
@@ -40,9 +40,9 @@ export MPICH_VERSION_DISPLAY=1
 export MPICH_CPUMASK_DISPLAY=1
 #export MPICH_COLL_SYNC=1 #force everyone into barrier before each collective
 #export MPICH_RDMA_ENABLED_CUDA=1
-#export MPICH_MAX_THREAD_SAFETY=multiple
+export MPICH_MAX_THREAD_SAFETY=multiple
 #export CRAY_CUDA_MPS=1
-export CUDA_VISIBLE_DEVICES=0
+#export CUDA_VISIBLE_DEVICES=0
 #export CRAY_CUDA_PROXY=0
 
 echo "Running..."
@@ -58,7 +58,7 @@ mkdir -p $WKDIR
 #SCRATCH=$WKDIR
 #cp ./*.py $WKDIR
 #cp -r /cray/css/users/jbalma/Innovation-Proposals/ML-Comm-Plugin/ml-mpi/examples/tf_models/models $WKDIR/
-cp -r /cray/css/users/jbalma/Innovation-Proposals/ML-Comm-Plugin/cscs_examples/cray-tensorflow/tf_models/models $WKDIR/
+cp -r /cray/css/users/jbalma/Innovation-Proposals/ML-Comm-Plugin/cray-bdc-deeplearning/tf_models/models $WKDIR/
 cd $WKDIR/models
 #rm -r checkpoint
 mkdir checkpoint
@@ -70,8 +70,8 @@ echo $PWD
 
 export PYTHONPATH="$PYTHONPATH:${WKDIR}/models"
 
-NP=128
-BATCH_SIZE=128
+NP=256
+BATCH_SIZE=64
 NUM_IMG_TRAIN=960831
 NUM_IMG_TEST=320336
 
@@ -84,7 +84,7 @@ let "NUM_BATCHES=NUM_EPOCHS * NUM_IMG_TRAIN/BATCH_SIZE"
 DATA_DIR=/lus/scratch/pjm/ImageNet_data
 HYPNO_CMD="hypno --audit --gpu --plot=gpu_power,node_power"
 
-export OMP_NUM_THREADS=36
+export OMP_NUM_THREADS=16
 #INIT_LR=0.08
 #$(echo "scale=2; $LR" | bc)
 #srun -n 10 -N 10 -C P100 --gres=gpu python dist_stacked.py  > dist_test.out
@@ -92,9 +92,14 @@ export OMP_NUM_THREADS=36
 #srun -N 1 -n 1 --gres=gpu -C K40 --exclusive python stacked.py ${DATA_PATH} ${FULL_DATAPATH}
 #srun -N 1 -n 1 --gres=gpu -C P100 --exclusive python dual_stacked.py ${DATA_PATH} ${FULL_DATAPATH}
 #srun --time=1:00:00 -l --ntasks=${NP} --ntasks-per-node=1 -C P100 --gres=gpu --exclusive --cpu_bind=none -u nvidia-smi
-aprun -r 1 -n ${NP} -N 1 -j 1 -d $OMP_NUM_THREADS -cc none python ${WKDIR}/models/official/resnet/imagenet_main.py \
+aprun -r 2 -n ${NP} -N 2 -j 1 -S 1 -d $OMP_NUM_THREADS -cc numa_node python ${WKDIR}/models/official/resnet/imagenet_main.py \
   --resnet_size=50 \
   --enable_ml_comm=1 \
+  --train_epochs 100 \
+  --init_lr 0.1 \
+  --base_lr 40.0 \
+  --warmup_epochs 12 \
+  --weight_decay 0.0005 \
   --model_dir=${WKDIR}/models/checkpoint \
   --benchmark_log_dir=${WKDIR}/models/checkpoint \
   --export_dir=${WKDIR}/models/checkpoint \

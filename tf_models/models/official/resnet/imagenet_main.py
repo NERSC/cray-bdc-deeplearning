@@ -27,21 +27,21 @@ rank_id=0
 try:
     rank_id = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
 
-    print("rank id: ", rank_id)
+    #print("rank id: ", rank_id)
     #if(rank_id==0): gpu_list = '0'
 except:
-    print("Can't find OMPI_COMM_WORLD_LOCAL_RANK")
+    #print("Can't find OMPI_COMM_WORLD_LOCAL_RANK")
     
     try:
         rank_id = int(os.environ['SLURM_PROCID'])
 
         #if(rank_id==0): gpu_list = '0'
     except:
-        print("Can't find SLURM_PROCID")
+        print("Can't find SLURM_PROCID or OMPI_COMM_WORLD_LOCAL_RANK")
         rank_id = 0
 
 
-print("rank id set to : ", rank_id)
+#print("rank id set to : ", rank_id)
     
 
 
@@ -49,14 +49,14 @@ try:
     check_gpu = str(os.environ['CUDA_VISIBLE_DEVICES'])
 
     
-    print(rank_id, " sees gpu: ", gpu_visible, ", setting visible devices...")
+    print(rank_id, " sees GPU: ", check_gpu, " set for visible devices...using GPUs")
 
-    os.environ['CUDA_VISIBLE_DEVICES']=gpu_visible
 
 except:
 
     
-    print(rank_id, " sees no gpu, so using CPUs instead with OMP_NUM_THREADS...")
+    check_cpu = str(os.environ['OMP_NUM_THREADS'])
+    print(rank_id, " sees no GPU, so using CPU with OMP_NUM_THREADS: ", check_cpu)
 
     #os.environ['OMP_NUM_THREADS']=gpu_visible
 
@@ -339,21 +339,27 @@ def _get_block_sizes(resnet_size):
 
 def imagenet_model_fn(features, labels, mode, params):
   """Our model_fn for ResNet to be used with our Estimator."""
-
   mlcomm = params['mlcomm']
-  base_lr = 40.
-  init_lr = 0.1 
-  
+  wd = params['weight_decay']
+  base_lr = params['base_lr']
+  init_lr = params['init_lr'] #learning rate used at beginning of warmup, reaches base_lr after warmup_epochs
+  nwarmup = params['warmup_epochs']
+  ndecay = params['train_epochs'] - nwarmup
+
+  #base_lr = 18.
+  #init_lr = 0.01
+
   # CRAY MODIFIED
   if mlcomm == 1:
     learning_rate_fn = resnet_run_loop.learning_rate_warmup_poly_decay(
         batch_size=params['batch_size'], num_images=_NUM_IMAGES['train'],
-        learning_rate_0=init_lr, learning_rate_base=base_lr, decay_epochs=195, warmup_epochs=5, mlcomm=params['mlcomm'])
+        learning_rate_0=init_lr, learning_rate_base=base_lr, decay_epochs=ndecay, warmup_epochs=nwarmup, mlcomm=mlcomm)
+
         #learning_rate_base=40 for 1024 workers, gbs=32k
         #learning_rate_base=4 for gbs=256
         #learning_rate_base=5 for gbs=512
         #learning_rate_base=9 for gbs=1024
-        
+
         #learning_rate_base=14 for gbs=4096
 
   # END CRAY MODIFIED
@@ -369,7 +375,7 @@ def imagenet_model_fn(features, labels, mode, params):
       mode=mode,
       model_class=ImagenetModel,
       resnet_size=params['resnet_size'],
-      weight_decay=1e-4,
+      weight_decay=wd,
       learning_rate_fn=learning_rate_fn,
       momentum=0.9,
       data_format=params['data_format'],
@@ -380,8 +386,8 @@ def imagenet_model_fn(features, labels, mode, params):
       loss_filter_fn=None,
       multi_gpu=params['multi_gpu'],
       dtype=params['dtype'],
-      mlcomm=params['mlcomm'],
-  )
+      mlcomm=mlcomm,
+    )
 
 
 def main(argv):
@@ -389,7 +395,7 @@ def main(argv):
       resnet_size_choices=[18, 34, 50, 101, 152, 200])
 
   parser.set_defaults(
-      train_epochs=200
+      train_epochs=100
   )
 
   flags = parser.parse_args(args=argv[1:])
