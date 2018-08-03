@@ -21,6 +21,52 @@ from __future__ import print_function
 import os
 import sys
 
+
+rank_id=0
+
+try:
+    rank_id = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
+
+    #print("rank id: ", rank_id)
+    #if(rank_id==0): gpu_list = '0'
+except:
+    #print("Can't find OMPI_COMM_WORLD_LOCAL_RANK")
+    
+    try:
+        rank_id = int(os.environ['SLURM_PROCID'])
+
+        #if(rank_id==0): gpu_list = '0'
+    except:
+        print("Can't find SLURM_PROCID or OMPI_COMM_WORLD_LOCAL_RANK")
+        rank_id = 0
+
+
+#print("rank id set to : ", rank_id)
+    
+
+
+try:
+    check_gpu = str(os.environ['CUDA_VISIBLE_DEVICES'])
+
+    
+    print(rank_id, " sees GPU: ", check_gpu, " set for visible devices...using GPUs")
+
+
+except:
+
+    
+    check_cpu = str(os.environ['OMP_NUM_THREADS'])
+    print(rank_id, " sees no GPU, so using CPU with OMP_NUM_THREADS: ", check_cpu)
+
+    #os.environ['OMP_NUM_THREADS']=gpu_visible
+
+
+
+
+
+
+
+
 import tensorflow as tf  # pylint: disable=g-bad-import-order
 
 from official.resnet import imagenet_preprocessing
@@ -37,7 +83,9 @@ _NUM_IMAGES = {
 }
 
 _NUM_TRAIN_FILES = 1024
-_SHUFFLE_BUFFER = 1500
+_NUM_VAL_FILES = 128
+#_SHUFFLE_BUFFER = 1500
+_SHUFFLE_BUFFER = 15000 
 
 ###############################################################################
 # Data processing
@@ -177,14 +225,22 @@ def input_fn(is_training, data_dir, batch_size, num_epochs=1,
 
   if is_training:
     # Shuffle the input files
+    #dataset = dataset.shuffle(buffer_size=_NUM_TRAIN_FILES)
     dataset = dataset.shuffle(buffer_size=_NUM_TRAIN_FILES)
+    #dataset = dataset.shard(numworkers,workerid)
   else:
-    dataset = dataset.shard(numworkers,workerid)
+    #shuffle the validation files
+    dataset = dataset.shuffle(buffer_size=_NUM_VAL_FILES)
+    #dataset = dataset.shard(numworkers,workerid)
 
   num_images = is_training and _NUM_IMAGES['train'] or _NUM_IMAGES['validation']
 
   # Convert to individual records
   dataset = dataset.flat_map(tf.data.TFRecordDataset)
+
+  if not is_training:
+    dataset = dataset.shard(numworkers,workerid)
+    
 
   return resnet_run_loop.process_record_dataset(
       dataset, is_training, batch_size, _SHUFFLE_BUFFER, parse_record,
@@ -283,17 +339,35 @@ def _get_block_sizes(resnet_size):
 
 def imagenet_model_fn(features, labels, mode, params):
   """Our model_fn for ResNet to be used with our Estimator."""
-  
+  mlcomm = params['mlcomm']
+  wd = params['weight_decay']
+  base_lr = params['base_lr']
+  init_lr = params['init_lr'] #learning rate used at beginning of warmup, reaches base_lr after warmup_epochs
+  nwarmup = params['warmup_epochs']
+  ndecay = params['train_epochs'] - nwarmup
+
+  #base_lr = 18.
+  #init_lr = 0.01
+
   # CRAY MODIFIED
-  learning_rate_fn = resnet_run_loop.learning_rate_warmup_poly_decay(
-       batch_size=params['batch_size'], num_images=_NUM_IMAGES['train'],
-       learning_rate_0=0.1, learning_rate_base=19.5, decay_epochs=88, warmup_epochs=12, mlcomm=params['mlcomm'])
+  if mlcomm == 1:
+    learning_rate_fn = resnet_run_loop.learning_rate_warmup_poly_decay(
+        batch_size=params['batch_size'], num_images=_NUM_IMAGES['train'],
+        learning_rate_0=init_lr, learning_rate_base=base_lr, decay_epochs=ndecay, warmup_epochs=nwarmup, mlcomm=mlcomm)
+
+        #learning_rate_base=40 for 1024 workers, gbs=32k
+        #learning_rate_base=4 for gbs=256
+        #learning_rate_base=5 for gbs=512
+        #learning_rate_base=9 for gbs=1024
+
+        #learning_rate_base=14 for gbs=4096
+
   # END CRAY MODIFIED
-  
-  #learning_rate_fn = resnet_run_loop.learning_rate_with_decay(
-  #    batch_size=params['batch_size'], batch_denom=256,
-  #    num_images=_NUM_IMAGES['train'], boundary_epochs=[30, 60, 80, 90],
-  #    decay_rates=[1, 0.1, 0.01, 0.001, 1e-4])
+  else:
+    learning_rate_fn = resnet_run_loop.learning_rate_with_decay(
+      batch_size=params['batch_size'], batch_denom=256,
+      num_images=_NUM_IMAGES['train'], boundary_epochs=[30, 60, 80, 90],
+      decay_rates=[1, 0.1, 0.01, 0.001, 1e-4])
 
   return resnet_run_loop.resnet_model_fn(
       features=features,
@@ -301,7 +375,7 @@ def imagenet_model_fn(features, labels, mode, params):
       mode=mode,
       model_class=ImagenetModel,
       resnet_size=params['resnet_size'],
-      weight_decay=1e-4,
+      weight_decay=wd,
       learning_rate_fn=learning_rate_fn,
       momentum=0.9,
       data_format=params['data_format'],
@@ -312,8 +386,8 @@ def imagenet_model_fn(features, labels, mode, params):
       loss_filter_fn=None,
       multi_gpu=params['multi_gpu'],
       dtype=params['dtype'],
-      mlcomm=params['mlcomm'],
-  )
+      mlcomm=mlcomm,
+    )
 
 
 def main(argv):
@@ -325,6 +399,11 @@ def main(argv):
   )
 
   flags = parser.parse_args(args=argv[1:])
+  #procid = os.environ['SLURM_PROCID']
+  #procid = os.environ['ALPS_APP_PE']
+  #flags.model_dir = flags.model_dir + '/' + procid 
+  #flags.benchmark_log_dir = flags.benchmark_log_dir + '/' + procid 
+  #flags.export_dir = flags.export_dir + '/' + procid 
   input_function = flags.use_synthetic_data and get_synth_input_fn() or input_fn
 
   resnet_run_loop.resnet_main(
@@ -333,5 +412,7 @@ def main(argv):
 
 
 if __name__ == '__main__':
+
+
   tf.logging.set_verbosity(tf.logging.WARN)
   main(argv=sys.argv)

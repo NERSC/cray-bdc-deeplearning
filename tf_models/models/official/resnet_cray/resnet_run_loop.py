@@ -27,6 +27,10 @@ import argparse
 import os
 import numpy as np
 import tensorflow as tf  # pylint: disable=g-bad-import-order
+#CRAY ADDED
+#import tensorflow.contrib.eager as tfe
+#tfe.enable_eager_execution()
+#DONE CRAY ADDED
 
 from official.resnet import resnet_model
 from official.utils.arg_parsers import parsers
@@ -37,12 +41,69 @@ from official.utils.misc import model_helpers
 import time
 from datetime import datetime
 
+
+
 # CRAY ADDED
 import ml_comm as mc
 import math
 from tensorflow.python.ops import math_ops
 from lars import GDMomentumLARSOptimizer
 #
+
+from tensorflow.python.client import device_lib
+#END CRAY
+
+#CRAY ADDED
+def get_available_gpus(rank_id,num_local_ranks):
+
+#This function is intended to be used with dense GPU nodes 
+#where we need to assign ranks to GPUs with proper affinity 
+#and make prevent each rank's instance of tensorflow 
+#from allocating multiple GPUs, which results in OOM or 
+#other insane behaviors. Might need to do something similar for
+#rank assignment per socket, hence the unused local_cpu_list
+
+    gpu_id = str(rank_id%num_local_ranks)
+    USE_GPU=True 
+    #gpu_id = str([0,1,2,3,4,5,6,7])
+    #os.environ['CUDA_VISIBLE_DEVICES']='0,1,2,3,4,5,6,7'
+    gpu_name = '/device:GPU:'+gpu_id
+    with tf.device(gpu_name):
+        local_device_protos = device_lib.list_local_devices()
+    
+        local_gpu_list = [x.name for x in local_device_protos if x.device_type == 'GPU']
+        local_cpu_list = [x.name for x in local_device_protos if x.device_type == 'CPU']
+    assign_dev_list = []
+    
+    gpu_list=[]
+    for i,gpu in enumerate(local_gpu_list):
+        print(rank_id, ": checking ", gpu)
+        dev_id=str(gpu).split(':')[2]
+        print("dev_id = ", dev_id)
+        if(str(gpu_id) in str(dev_id)):
+            print("found device matching rank id: ", rank_id, " as ", dev_id)
+            
+            #print("setting up device list from: ", local_device_protos)
+            #gpu[-1]=str(rank_id)
+            assign_dev_list.append(gpu)
+            gpu_list.append(dev_id)
+        else:
+            assign_dev_list.append(gpu_name)
+            gpu_list.append(gpu_id)
+
+            
+    if(USE_GPU):
+
+        print(rank_id, ": using gpu_list = ", gpu_list, " and assign_list = ", assign_dev_list," to set visible devices!")#, setting gpu_idx=",gidx)
+        gpu_visible = str(gpu_list)
+    
+        print(rank_id, ": Setting visible device to -> ", gpu_visible)
+
+        os.environ['CUDA_VISIBLE_DEVICES']=str(gpu_visible)
+            
+            
+    return assign_dev_list
+#DONE CRAY
 
 # CRAY ADDED
 # since this script uses a monitored session, we need to create a hook to initialize
@@ -51,6 +112,7 @@ class BcastTensors(tf.train.SessionRunHook):
 
   def __init__(self):
     self.bcast = None
+    
 
   def begin(self):
     if not self.bcast:
@@ -59,6 +121,10 @@ class BcastTensors(tf.train.SessionRunHook):
 
   def after_create_session(self, session, coord):
      session.run(self.bcast)
+     
+     #global_step = tf.train.get_global_step()
+     #epoch = tf.Print(global_step, [global_step], "Epoch: ")
+     #print(session.run(epoch))
 
 # END CRAY ADDED
 
@@ -67,10 +133,13 @@ class BcastTensors(tf.train.SessionRunHook):
 # since this script uses a monitored session, we need to create a hook to average metrics at the end of epochs
 class AverageTrainMetrics(tf.train.SessionRunHook):
 
-  def __init__(self,loss,metrics,log_freq,batch_size):
+  def __init__(self,loss, metrics, log_freq, batch_size, lr, epoch):
     self.log_freq = log_freq
+    self.lr = lr
+    self.epoch_true = 0
+    self.epoch = epoch
     self.batch_size = batch_size * mc.get_nranks()
-    self.both = [loss,metrics['accuracy'][0]]
+    self.both = [loss,metrics['accuracy'][0],lr,epoch]
     self.samps = 0.
     self.perf = 0.
     self.step = 0
@@ -79,6 +148,7 @@ class AverageTrainMetrics(tf.train.SessionRunHook):
 
   def begin(self):
     self.step = 0
+    self.epoch_true += 1
     self.start_time = time.time()
 
   def before_run(self, run_context):
@@ -91,9 +161,11 @@ class AverageTrainMetrics(tf.train.SessionRunHook):
       current_time = time.time()
       duration = current_time - self.start_time
       self.start_time = current_time
-
       loss_value = np.asarray([run_values.results[0]],dtype='float32')
       acc_value = np.asarray([run_values.results[1]],dtype='float32')
+      #lr = np.asarray([run_values.results[2]],dtype='float32')
+      #epoch = np.asarray([run_values.results[3]],dtype='float32')
+
       examples_per_sec = self.log_freq * self.batch_size / duration
       sec_per_batch = float(duration / self.log_freq)
       mc.average(loss_value)
@@ -102,6 +174,7 @@ class AverageTrainMetrics(tf.train.SessionRunHook):
       format_str = ('%s: step %d, loss = %.3f, acc = %.3f, (%.1f examples/sec; %.3f '
                     'sec/batch)')
       if (mc.get_rank() == 0):
+          print ("available values = ", run_values)
           print (format_str % (datetime.now(), self.step, loss_value, acc_value,
                            examples_per_sec, sec_per_batch ))
           
@@ -110,11 +183,18 @@ class AverageTrainMetrics(tf.train.SessionRunHook):
       self.sums  = self.sums + 1
 
   def end(self,session):
+
+    lr = session.run(self.lr)
+    #epoch = session.run(self.epoch)
   
-    format_str = ('Session ENDED at %s: step %d (%.1f examples/sec; %.3f '
-                  'sec/batch)')
+    format_str = ('TRAIN Session ENDED at %s: step %d (%.1f examples/sec; %.3f '
+                  'sec/batch), learning rate: %.5f')
+    self.epoch_true = tf.train.global_step(session, self.epoch)/(self.step+1)
+    
     if (mc.get_rank() == 0):
-      print (format_str % (datetime.now(), self.step, self.samps/self.sums, self.perf/self.sums))
+      print('Epoch: ', self.epoch_true)
+      print('global_step: %s' % tf.train.global_step(session, self.epoch))
+      print (format_str % (datetime.now(), self.step, self.samps/self.sums, self.perf/self.sums, lr))
 
 class AverageEvalMetrics(tf.train.SessionRunHook):
 
@@ -125,8 +205,8 @@ class AverageEvalMetrics(tf.train.SessionRunHook):
     self.samps = 0
     self.perf = 0
     self.step = 0
-    self.loss = 0.
-    self.acc = 0.
+    self.loss = np.asarray([0.],dtype='float32') 
+    self.acc = np.asarray([0.],dtype='float32') 
     self.start_time = None
 
   def begin(self):
@@ -160,14 +240,17 @@ class AverageEvalMetrics(tf.train.SessionRunHook):
 
     self.loss = self.loss / self.step
     self.acc  = self.acc / self.step
-  
+    
     mc.average(self.loss)
     mc.average(self.acc)
     
-    format_str = ('Session ENDED at %s: step %d, loss = %.3f, accuracy = %.3f (%.1f examples/sec; %.3f '
+    format_str = ('EVAL Session ENDED at %s: step %d, loss = %.3f, accuracy = %.3f (%.1f examples/sec; %.3f '
                   'sec/batch)')
+
+
     if (mc.get_rank() == 0):
       print (format_str % (datetime.now(), self.step, self.loss, self.acc, self.samps/self.step, self.perf/self.step))
+      
 
 # END CRAY ADDED
 
@@ -237,7 +320,10 @@ def process_record_dataset(dataset, is_training, batch_size, shuffle_buffer,
   # will happen synchronously during run time. We prefetch here again to
   # background all of the above processing work and keep it out of the
   # critical training path.
-  dataset = dataset.prefetch(1)
+  #CRAY ADDED
+  #dataset = dataset.prefetch(1)
+  dataset = dataset.prefetch(batch_size)
+  #CRAY DONE
 
   return dataset
 
@@ -309,25 +395,51 @@ def learning_rate_warmup_poly_decay(
 
   eff_batch_size = batch_size
   if (mlcomm == 1):
-    eff_batch_size = eff_batch_size / mc.get_nranks()
+    eff_batch_size = eff_batch_size * mc.get_nranks()
 
   batches_per_epoch = num_images / eff_batch_size
   decay_steps       = batches_per_epoch * decay_epochs
   warmup_steps      = batches_per_epoch * warmup_epochs
-
+  
   lr_0 = tf.cast(learning_rate_0, tf.float32)
   lr_base = tf.cast(learning_rate_base, tf.float32)
   d_steps = tf.cast(decay_steps, tf.float32)
   w_steps = tf.cast(warmup_steps, tf.float32)
 
+
   def learning_rate_fn(global_step):
+
     global_step = tf.cast(global_step, tf.float32)
-   
+    #cstep = global_step*num_images/eff_batch_size
+    epoch = (d_steps + w_steps)/(global_step+1)
+
+    total_epochs = decay_epochs + warmup_epochs
+
+    tf.Print(epoch, [epoch], "Epoch: ")
+    #current_step = tf.Print(cstep, [cstep], "Current train steps so far: ")
+    if (mlcomm == 1):
+        current_lr = learning_rate_0*math.pow(1.0-(decay_steps-warmup_steps)/decay_steps,2)
+        if (mc.get_rank()==0):
+            print("Using Cray learning_rate_warmup_poly_decay(): ")
+            print(" -> effective batch size: ", eff_batch_size)
+            print(" -> batches per epoch: ", batches_per_epoch)
+
+            print(" -> initial learning rate: ", learning_rate_0)
+            print(" -> learning rate base: ", learning_rate_base)
+            print(" -> starting global learning rate at first epoch: ", current_lr)
+            print(" -> decay after ", decay_epochs, " epochs")
+            print("     -> decay steps: ", decay_steps)
+            print(" -> warmup with ", warmup_epochs, " epochs")
+            print("     -> warmup steps: ", warmup_steps)
+            print(" -> number workers: ", mc.get_nranks())
+            #print(" -> Finished Epoch: ", tf.get_session_tensor(epoch), "/", total_epochs)
+
+    #global_step = tf.cast(global_step, tf.float32)   
     def lr_warmup(): return (lr_0 + global_step * (lr_base - lr_0) / w_steps)
     def lr_poly(): return (lr_base * math_ops.pow((1 - (global_step - w_steps) / d_steps), 2))
 
     return tf.cond(tf.less(global_step, warmup_steps), lambda: lr_warmup(), lambda: lr_poly()) 
-
+    
   return learning_rate_fn
 
 
@@ -436,12 +548,16 @@ def resnet_model_fn(features, labels, mode, model_class,
     tf.identity(learning_rate, name='learning_rate')
     tf.summary.scalar('learning_rate', learning_rate)
 
-    optimizer = GDMomentumLARSOptimizer(
-        learning_rate=learning_rate)
+    if (mlcomm == 1):
+      #GDMomentumLARS(self, learning_rate, momentum_coeff=0.9, weight_decay_coeff=0.0005, lars_coeff=0.001, name="GDMomentumLARS")
+      optimizer = GDMomentumLARSOptimizer(
+            momentum_coeff=0.9, weight_decay_coeff=0.0005, 
+            lars_coeff=0.001, learning_rate=learning_rate)
 
-    #optimizer = tf.train.MomentumOptimizer(
-    #    learning_rate=learning_rate,
-    #    momentum=momentum)
+    else:
+      optimizer = tf.train.MomentumOptimizer(
+          learning_rate=learning_rate,
+          momentum=momentum)
 
     # If we are running multi-GPU, we need to wrap the optimizer.
     if multi_gpu:
@@ -470,7 +586,7 @@ def resnet_model_fn(features, labels, mode, model_class,
           gs_and_vs = [(g,v) for (_,v), g in zip(grads_and_vars, grads)]
 
           minimize_op = optimizer.apply_gradients(gs_and_vs,
-                                                  global_step=tf.train.get_or_create_global_step())
+                                                  global_step=global_step)
 
       else:
           minimize_op = optimizer.minimize(loss, global_step)
@@ -493,7 +609,7 @@ def resnet_model_fn(features, labels, mode, model_class,
   eval_hooks  = None
   if (mlcomm == 1):
       if mode == tf.estimator.ModeKeys.TRAIN: 
-          train_hooks = [BcastTensors(), AverageTrainMetrics(loss,metrics,log_freq,batch_size)]
+          train_hooks = [BcastTensors(), AverageTrainMetrics(loss,metrics,log_freq,batch_size,lr=tf.cast(learning_rate,tf.float32),epoch=global_step)]
           eval_hooks  = None
       else:
           train_hooks = None
@@ -570,17 +686,43 @@ def resnet_main(flags, model_function, input_function, num_train_samps, num_eval
   # allow_soft_placement = True, which is required for multi-GPU and not
   # harmful for other modes.
 
-  #CRAY ADDED
-  gpu_options = tf.GPUOptions(allow_growth=True, per_process_gpu_memory_fraction = 0.9)
-  #DONE CRAY ADDED
+
+  myrank     = 0
+  numworkers = 1
+  if (flags.enable_ml_comm == 1):
+
+      # initialize the Cray PE ML Plugin
+      # config the thread team (correcting the number of epochs for the effectice batch size))
+      #totsize = sum([reduce(lambda x, y: x*y, v.get_shape().as_list()) for v in tf.trainable_variables()])
+     
+      totsize = 25551401 #Specific size for resnet50-v2
+      mc.init(2, 1, totsize, "tensorflow")
+      myrank = mc.get_rank()
+      numworkers = mc.get_nranks()
+      if (myrank == 0):
+          print("ResNet with {:9d} parameters".format(totsize))
+
+      max_steps_train = int(math.ceil(flags.train_epochs *
+                                      (num_train_samps + num_eval_samps) / (mc.get_nranks() * flags.batch_size)))
+                    #(0,0,num_steps_before_going_nonblock, max_steps_train, verbose=1, how_often_to_print=100)
+      mc.config_team(0, 0, max_steps_train, max_steps_train, 1, 100)
+
+      flags.model_dir = flags.model_dir if mc.get_rank() == 0 else None
+      flags.benchmark_log_dir = flags.benchmark_log_dir if mc.get_rank() == 0 else None
+      flags.export_dir = flags.export_dir if mc.get_rank() == 0 else None
+      
+
+  else:
+    rank_id = myrank 
+
 
   session_config = tf.ConfigProto( log_device_placement=False,
       inter_op_parallelism_threads=flags.inter_op_parallelism_threads,
       intra_op_parallelism_threads=flags.intra_op_parallelism_threads,
-      allow_soft_placement=True, gpu_options=gpu_options 
+      allow_soft_placement=True
       )
 
-  # Set up a RunConfig to save checkpoint and set session config.
+    # Set up a RunConfig to save checkpoint and set session config.
   run_config = tf.estimator.RunConfig().replace(save_checkpoints_steps=500,
                                                 session_config=session_config)
   
@@ -591,33 +733,19 @@ def resnet_main(flags, model_function, input_function, num_train_samps, num_eval
           'data_format': flags.data_format,
           'batch_size': flags.batch_size,
           'multi_gpu': flags.multi_gpu,
+          'train_epochs': flags.train_epochs,
           'version': flags.version,
           'loss_scale': flags.loss_scale,
           'dtype': flags.dtype,
           'mlcomm': flags.enable_ml_comm,
           'log_freq': flags.global_perf_log_freq,
+          'weight_decay': flags.weight_decay,
+          'init_lr': flags.init_lr,
+          'base_lr': flags.base_lr,
+          'warmup_epochs': flags.warmup_epochs,
+          'log_freq': flags.global_perf_log_freq,
+
       })
-
-  myrank     = 0
-  numworkers = 1
-  if (flags.enable_ml_comm == 1):
-
-      # initialize the Cray PE ML Plugin
-      # config the thread team (correcting the number of epochs for the effectice batch size))
-      #totsize = sum([reduce(lambda x, y: x*y, v.get_shape().as_list()) for v in tf.trainable_variables()])
-      totsize = 25551401
-      mc.init(2, 1, totsize, "tensorflow")
-      myrank = mc.get_rank()
-      numworkers = mc.get_nranks()
-      if (myrank == 0):
-          print("ResNet with {:9d} parameters".format(totsize))
-
-      max_steps_train = int(math.ceil(flags.train_epochs *
-                                      (num_train_samps + num_eval_samps) / (mc.get_nranks() * flags.batch_size)))
-      
-      mc.config_team(0, 0, max_steps_train, max_steps_train, 1, 100)
-  
-      flags.benchmark_log_dir = flags.benchmark_log_dir if mc.get_rank() == 0 else None
 
   benchmark_logger = logger.config_benchmark_logger(flags.benchmark_log_dir)
   benchmark_logger.log_run_info('resnet')
@@ -636,7 +764,8 @@ def resnet_main(flags, model_function, input_function, num_train_samps, num_eval
                             flags.epochs_between_evals,
                             flags.num_parallel_calls, flags.multi_gpu, numworkers, myrank)
 
-    classifier.train(input_fn=input_fn_train, steps=num_train_samps/(numworkers*flags.batch_size),
+    tsteps = math.ceil(float(flags.epochs_between_evals*num_train_samps) / (numworkers*flags.batch_size))
+    classifier.train(input_fn=input_fn_train, steps=tsteps,
                      max_steps=flags.max_train_steps)
 
     if (myrank == 0):
@@ -645,7 +774,7 @@ def resnet_main(flags, model_function, input_function, num_train_samps, num_eval
     # Evaluate the model and print results
     def input_fn_eval():
       return input_function(False, flags.data_dir, flags.batch_size,
-                            1, flags.num_parallel_calls, flags.multi_gpu, numworkers, myrank)
+                            3, flags.num_parallel_calls, flags.multi_gpu, numworkers, myrank)
 
     # flags.max_train_steps is generally associated with testing and profiling.
     # As a result it is frequently called with synthetic data, which will
@@ -653,8 +782,9 @@ def resnet_main(flags, model_function, input_function, num_train_samps, num_eval
     # (which is generally unimportant in those circumstances) to terminate.
     # Note that eval will run for max_train_steps each loop, regardless of the
     # global_step count.
+    esteps = math.ceil(float(num_eval_samps) / (numworkers*flags.batch_size))
     eval_results = classifier.evaluate(input_fn=input_fn_eval,
-                                       steps=num_eval_samps/(numworkers*flags.batch_size))
+                                       steps=esteps)
 
     benchmark_logger.log_evaluation_result(eval_results)
 
@@ -718,6 +848,32 @@ class ResnetArgParser(argparse.ArgumentParser):
 	    '--global_perf_log_freq', '-pf', type=int, default=50,
 	    help='[default: %(default)s] Number of steps after which to report global (all process averages) training loss and performance'
     )
+
+
+
+    self.add_argument(
+        '--warmup_epochs', '-we', type=int, default=0,
+        help='[default: %(default)s] Number of warmup epochs when using LARS'
+    )
+
+
+    self.add_argument(
+        '--base_lr', '-blr', type=float, default=1.0,
+        help='[default: %(default)s] Learning rate to start after warmup epochs finish when using LARS'
+    )
+
+
+    self.add_argument(
+            '--init_lr', '-ilr', type=float, default=0.1,
+            help='[default: %(default)s] Learning rate to start warmup with when using LARS'
+    )
+
+
+    self.add_argument(
+            '--weight_decay', '-wd', type=float, default=1e-4,
+            help='[default: %(default)s] Weight decay to use during training'
+    )
+
 
 
   def parse_args(self, args=None, namespace=None):

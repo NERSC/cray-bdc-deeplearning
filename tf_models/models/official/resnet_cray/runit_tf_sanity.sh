@@ -5,8 +5,10 @@
 ulimit -s unlimited
 ulimit -c unlimited
 #cudatoolkit/8.0.61_2.4.9-6.0.6.0_4.1__g899857c
-source /cray/css/users/jbalma/bin/setup_env_cuda9.sh
-source /cray/css/users/jbalma/bin/env_python.sh
+#source /cray/css/users/jbalma/bin/setup_env_cuda9.sh
+#source /cray/css/users/jbalma/bin/setup_env_cpu_tf.sh 
+source ./setup_env_jupiter.sh
+#source /cray/css/users/jbalma/bin/env_python.sh
 #module load cray-python
 #module use /cray/css/perfeng/ml-plugin/modulefiles
 #module load craype-ml-plugin-py2/1.0.1
@@ -15,7 +17,8 @@ source /cray/css/users/jbalma/bin/env_python.sh
 #module list
 #module load cray-python
 #module load /cray/css/perfeng/pjm/TFbuilds/tmp_inst/modulefiles/craype-ml-plugin-py2/1.0.1
-module load /cray/css/users/jbalma/Innovation-Proposals/ML-Comm-Plugin/ml-mpi/tmp_inst/modulefiles/craype-ml-plugin-py2/1.1.0
+module load craype-ml-plugin-py2/1.1.1 
+#module load /cray/css/users/jbalma/Innovation-Proposals/ML-Comm-Plugin/ml-mpi/tmp_inst/modulefiles/craype-ml-plugin-py2/1.1.0
 
 module list
 
@@ -36,7 +39,7 @@ export MPICH_CPUMASK_DISPLAY=1
 #export MPICH_RDMA_ENABLED_CUDA=1
 #export MPICH_MAX_THREAD_SAFETY=multiple
 #export CRAY_CUDA_MPS=1
-export CUDA_VISIBLE_DEVICES=0
+#export CUDA_VISIBLE_DEVICES=0
 #export CRAY_CUDA_PROXY=0
 
 echo "Running..."
@@ -51,14 +54,16 @@ rm -rf $WKDIR
 mkdir -p $WKDIR
 
 #cp ./*.py $WKDIR
-cp -r /cray/css/users/jbalma/Innovation-Proposals/ML-Comm-Plugin/ml-mpi/examples/tf_models/models $WKDIR/
+cp -r /cray/css/users/jbalma/Innovation-Proposals/ML-Comm-Plugin/cray-bdc-deeplearning/tf_models/models $WKDIR/
 cd $WKDIR/models
 #rm -r checkpoint
 mkdir checkpoint
 export SLURM_WORKING_DIR=$WKDIR/models
 export PYTHONPATH="$PYTHONPATH:${WKDIR}/models"
-
-NP=8
+#export TF_CPP_MIN_LOG_LEVEL=3
+#export TF_CPP_MIN_VLOG_LEVEL=0
+NP=64
+NODES=32
 BATCH_SIZE=32
 NUM_IMG_TRAIN=960831
 NUM_IMG_TEST=320336
@@ -68,10 +73,16 @@ NUM_EPOCHS=1
 let "NUM_BATCHES=NUM_EPOCHS * NUM_IMG_TRAIN/BATCH_SIZE"
 
 #DATA_DIR=/lus/scratch/jbalma/DataSets/Uber/imagenet_tfrecords_224
-DATA_DIR=/lus/scratch/jbalma/ImageNet/ILSVRC2016
+#DATA_DIR=/lus/scratch/jbalma/ImageNet/ILSVRC2016
+#DATA_DIR=/lus/scratch/nhill/ImageNet_data 
+DATA_DIR=/lus/scratch/jbalma/ImageNet/ImageNet_tfrecords
 HYPNO_CMD="hypno --audit --gpu --plot=gpu_power,node_power"
 
-export OMP_NUM_THREADS=1
+export OMP_NUM_THREADS=12
+
+#export GPUGB_PER_PROC=$(echo print 0.9/${NP}. | python)
+#export LIBSCI_QUOTA_MULTIPLIER=$(echo print 0.9/${NP}. | python)
+
 #INIT_LR=0.08
 #$(echo "scale=2; $LR" | bc)
 #srun -n 10 -N 10 -C P100 --gres=gpu python dist_stacked.py  > dist_test.out
@@ -79,22 +90,34 @@ export OMP_NUM_THREADS=1
 #srun -N 1 -n 1 --gres=gpu -C K40 --exclusive python stacked.py ${DATA_PATH} ${FULL_DATAPATH}
 #srun -N 1 -n 1 --gres=gpu -C P100 --exclusive python dual_stacked.py ${DATA_PATH} ${FULL_DATAPATH}
 #srun --time=1:00:00 -l --ntasks=${NP} --ntasks-per-node=1 -C P100 --gres=gpu --exclusive --cpu_bind=none -u nvidia-smi
-srun --time=1:00:00 -l --ntasks=${NP} --ntasks-per-node=1 -C P100 --gres=gpu --exclusive --cpu_bind=rank -u python official/resnet/imagenet_main.py \
-	--resnet_size=50 \
-	--enable_ml_comm=1 \
-	--epochs_between_evals=1 \
-	--ml_comm_validate_init=1 \
-	--batch_size=$BATCH_SIZE \
-	--train_epochs=90 \
-	--max_train_steps=1024 \
-	--epochs_between_evals=1 \
-	--intra_op_parallelism_threads=1 \
-	--inter_op_parallelism_threads=1 \
-	--num_parallel_calls=1 \
-	--benchmark_log_dir="${WKDIR}/models/checkpoint/" \
-	--model_dir="${WKDIR}/models/checkpoint/" \
-	--export_dir="${WKDIR}/models/checkpoint/" \
-	--data_dir="${DATA_DIR}"
+srun --time=1:00:00 -l -N ${NODES} --ntasks=${NP} --ntasks-per-node=2 --ntasks-per-socket=1 -c ${OMP_NUM_THREADS} --exclusive --cpu_bind=rank_ldom -u python official/resnet/imagenet_main.py \
+  --resnet_size=50 \
+  --enable_ml_comm=1 \
+  --model_dir=${WKDIR}/models/checkpoint \
+  --benchmark_log_dir=${WKDIR}/models/checkpoint \
+  --export_dir=${WKDIR}/models/checkpoint \
+  --batch_size=${BATCH_SIZE} \
+  --intra_op_parallelism_threads=2 \
+  --inter_op_parallelism_threads=2 \
+  --data_dir=${DATA_DIR} \
+  --global_perf_log_freq=20 |& tee logfile
+
+
+#	--resnet_size=50 \
+#	--enable_ml_comm=1 \
+#	--epochs_between_evals=1 \
+#	--ml_comm_validate_init=1 \
+#	--batch_size=$BATCH_SIZE \
+#	--train_epochs=90 \
+#	--max_train_steps=1024 \
+#	--epochs_between_evals=1 \
+#	--intra_op_parallelism_threads=1 \
+#	--inter_op_parallelism_threads=1 \
+#	--num_parallel_calls=1 \
+#	--benchmark_log_dir="${WKDIR}/models/checkpoint/" \
+#	--model_dir="${WKDIR}/models/checkpoint/" \
+#	--export_dir="${WKDIR}/models/checkpoint/" \
+#	--data_dir="${DATA_DIR}"
 
 #	--use_synthetic_data
 	
@@ -107,7 +130,7 @@ srun --time=1:00:00 -l --ntasks=${NP} --ntasks-per-node=1 -C P100 --gres=gpu --e
 #	--num_parallel_calls=1 \
 #	--use_synthetic_data
 	#--benchmark_log_dir="${WKDIR}/checkpoint" \
-	#--data_dir=${DATA_DIR} \
+#	#--data_dir=${DATA_DIR} \
 #	--eval_dir="${WKDIR}/eval" \
 
 #0: usage: imagenet_main.py [-h] [--data_dir <DD>] [--model_dir <MD>]
