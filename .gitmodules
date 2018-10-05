@@ -1,0 +1,3 @@
+[submodule "hep_cnn"]
+	path = hep_cnn
+	url = git@github.com:sparticlesteve/hep_cnn_benchmark.git
